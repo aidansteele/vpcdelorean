@@ -1,0 +1,248 @@
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayToInternet:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnet 1
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Sub ${AWS::Region}a
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  RouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RouteInternet1:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayToInternet
+    Properties:
+      RouteTableId: !Ref RouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref RouteTable1
+
+  ## Subnet 2
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Sub ${AWS::Region}b
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+
+  RouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RouteInternet2:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayToInternet
+    Properties:
+      RouteTableId: !Ref RouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref RouteTable2
+
+  # GWLB
+
+  Gwlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: gateway
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 6081
+      Protocol: GENEVE
+      VpcId: !Ref Vpc
+      HealthCheckPort: 8080
+      HealthCheckProtocol: HTTP
+      Targets:
+        - Id: !Ref Delorean
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Gwlb
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      GatewayLoadBalancerArns: [!Ref Gwlb]
+      AcceptanceRequired: false
+
+  GwlbeSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Sub ${AWS::Region}a
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: true
+
+  GwlbVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.vpce.${AWS::Region}.${EndpointService}
+      VpcEndpointType: GatewayLoadBalancer
+      SubnetIds:
+        - !Ref GwlbeSubnet
+
+  RouteDelorean1:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 10.0.2.0/24
+      VpcEndpointId: !Ref GwlbVpcEndpoint
+      RouteTableId: !Ref RouteTable1
+
+  RouteDelorean2:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 10.0.1.0/24
+      VpcEndpointId: !Ref GwlbVpcEndpoint
+      RouteTableId: !Ref RouteTable2
+
+  ## Instances
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service: ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [ !Ref InstanceRole ]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow accelerated pings (and SSH, for debugging)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+        - CidrIp: "0.0.0.0/0"
+          FromPort: -1
+          ToPort: -1
+          IpProtocol: icmp
+
+  DeloreanSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow GENEVE
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 6081
+          ToPort: 6081
+          IpProtocol: udp
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 8080
+          ToPort: 8080
+          IpProtocol: tcp
+
+  Delorean:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-arm64-gp2
+      KeyName: !Ref KeyPairName
+      InstanceType: t4g.micro
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+        - !Ref DeloreanSecurityGroup
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: delorean
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -eux
+          hostnamectl set-hostname delorean;
+
+  MartyMcFly:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-arm64-gp2
+      KeyName: !Ref KeyPairName
+      InstanceType: t4g.micro
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref PublicSubnet1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -eux
+          hostnamectl set-hostname martymcfly;  
+
+  DocBrown:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-arm64-gp2
+      KeyName: !Ref KeyPairName
+      InstanceType: t4g.micro
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref PublicSubnet2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -eux
+          hostnamectl set-hostname docbrown;        
+
+Outputs:
+  DeloreanIp:
+    Value: !GetAtt Delorean.PublicIp
+  MartyMcFlyIp:
+    Value: !GetAtt MartyMcFly.PublicIp
+  DocBrownIp:
+    Value: !GetAtt DocBrown.PublicIp
